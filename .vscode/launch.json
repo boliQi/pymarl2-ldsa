@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PyMARL 调试",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "args": [
+        "--config=${input:algConfig}",
+        "--env-config=${input:envConfig}",
+        "with",
+        "env_args.map_name=${input:mapName}"
+      ],
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "algConfig",
+      "type": "pickString",
+      "description": "选择算法配置",
+      "options": [
+        "coma", "cw_qmix", "dop", "ippo", "iql", "lica", "ow_qmix", "qatten", "qmix", "qmix_att", "qmix_conv", "qmix_high_sample_efficiency", "qmix_large", "qmix_predator_prey", "qplex", "qtran", "riit", "vdn", "vdn_gfootball", "vmix", "wqmix"
+      ],
+      "default": "coma"
+    },
+    {
+      "id": "envConfig",
+      "type": "pickString",
+      "description": "选择环境配置",
+      "options": [
+        "sc2",
+        "gfootball",
+        "stag_hunt"
+      ],
+      "default": "sc2"
+    },
+    {
+      "id": "mapName",
+      "type": "promptString",
+      "description": "输入地图名称 (例如: corridor)",
+      "default": "corridor"
+    }
+  ]
+}
