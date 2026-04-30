@@ -17,6 +17,8 @@ class LDSAMAC:
 
         self.hidden_state_subtask_policy = None
         self.hidden_state_agent_embed = None
+        self.last_recl_role_embedding = None
+        self.last_subtask_prob_logit = None
 
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
         # Only select actions for the selected batch elements in bs
@@ -30,9 +32,20 @@ class LDSAMAC:
             self.agent.eval()
         else:
             self.agent.train()
-        agent_inputs = self._build_inputs(ep_batch, t) # [bs*n_agents, input_shape]
+        last_action = self._build_last_actions(ep_batch, t)
+        agent_inputs = self._build_inputs(ep_batch, t, last_action=last_action) # [bs*n_agents, input_shape]
         avail_actions = ep_batch["avail_actions"][:, t]
-        agent_outs, self.hidden_states_subtask_policy, self.hidden_states_agent_embed, subtask_prob_logit, subtask_embed = self.agent(agent_inputs, self.hidden_states_subtask_policy, self.hidden_states_agent_embed, test_mode=test_mode)
+        raw_obs = ep_batch["obs"][:, t]
+        agent_outs, self.hidden_states_subtask_policy, self.hidden_states_agent_embed, subtask_prob_logit, subtask_embed, recl_role_embedding = self.agent(
+            agent_inputs,
+            self.hidden_states_subtask_policy,
+            self.hidden_states_agent_embed,
+            test_mode=test_mode,
+            raw_obs=raw_obs,
+            last_action=last_action,
+        )
+        self.last_recl_role_embedding = recl_role_embedding
+        self.last_subtask_prob_logit = subtask_prob_logit.view(ep_batch.batch_size, self.n_agents, -1)
 
         # Softmax the agent outputs if they're policy logits
         if self.agent_output_type == "pi_logits":
@@ -82,17 +95,21 @@ class LDSAMAC:
     def _build_agents(self, input_shape):
         self.agent = agent_REGISTRY[self.args.agent](input_shape, self.args)
 
-    def _build_inputs(self, batch, t):
+    def _build_last_actions(self, batch, t):
+        if t == 0:
+            return th.zeros_like(batch["actions_onehot"][:, t])
+        return batch["actions_onehot"][:, t - 1]
+
+    def _build_inputs(self, batch, t, last_action=None):
         # Assumes homogenous agents with flat observations.
         # Other MACs might want to e.g. delegate building inputs to each agent
         bs = batch.batch_size
         inputs = []
         inputs.append(batch["obs"][:, t])  # b1av
         if self.args.obs_last_action:
-            if t == 0:
-                inputs.append(th.zeros_like(batch["actions_onehot"][:, t]))
-            else:
-                inputs.append(batch["actions_onehot"][:, t-1])
+            if last_action is None:
+                last_action = self._build_last_actions(batch, t)
+            inputs.append(last_action)
         if self.args.obs_agent_id:
             inputs.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).expand(bs, -1, -1))
 
@@ -107,3 +124,8 @@ class LDSAMAC:
             input_shape += self.n_agents
 
         return input_shape
+
+    def get_recl_parameters(self):
+        if hasattr(self.agent, "get_recl_parameters"):
+            return self.agent.get_recl_parameters()
+        return []

@@ -3,6 +3,7 @@ import os
 import pprint
 import time
 import threading
+import numpy as np
 import torch as th
 from types import SimpleNamespace as SN
 from utils.logging import Logger
@@ -95,6 +96,8 @@ def run_sequential(args, logger):
     args.n_agents = env_info["n_agents"]
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
+    args.obs_shape = env_info["obs_shape"]
+    args.n_enemies = env_info.get("n_enemies", getattr(args, "n_enemies", 0))
     args.accumulated_episodes = getattr(args, "accumulated_episodes", None)
 
     if getattr(args, 'agent_own_state_size', False):
@@ -110,6 +113,8 @@ def run_sequential(args, logger):
         "reward": {"vshape": (1,)},
         "terminated": {"vshape": (1,), "dtype": th.uint8},
     }
+    if getattr(args, "use_recl_analysis", False):
+        scheme["llm_role_class"] = {"vshape": (1,), "group": "agents", "dtype": th.long}
     groups = {
         "agents": args.n_agents
     }
@@ -122,6 +127,29 @@ def run_sequential(args, logger):
                           device="cpu" if args.buffer_cpu_only else args.device)
     # Setup multiagent controller here
     mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+
+    if getattr(args, "load_pretrained_recl", False):
+        pretrained_path = getattr(args, "pretrained_recl_path", "")
+        if pretrained_path and not os.path.isabs(pretrained_path):
+            project_root = dirname(dirname(dirname(abspath(__file__))))
+            pretrained_path = os.path.join(project_root, pretrained_path)
+        if pretrained_path and os.path.exists(pretrained_path):
+            recl_net = getattr(getattr(mac, "agent", None), "recl_net", None)
+            if recl_net is not None:
+                state = th.load(pretrained_path, map_location=lambda s, l: s)
+                recl_net.load_state_dict(state, strict=False)
+                logger.console_logger.info("Loaded pretrained RECL from {}".format(pretrained_path))
+            else:
+                logger.console_logger.info("RECL requested but not found on agent.")
+        else:
+            logger.console_logger.info("Pretrained RECL path not found: {}".format(pretrained_path))
+
+    if getattr(args, "freeze_recl", False):
+        recl_net = getattr(getattr(mac, "agent", None), "recl_net", None)
+        if recl_net is not None:
+            for param in recl_net.parameters():
+                param.requires_grad = False
+            logger.console_logger.info("RECL network parameters are frozen.")
 
     # Give runner the scheme
     runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)

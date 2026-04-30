@@ -1,4 +1,6 @@
 import copy
+import os
+import numpy as np
 from components.episode_buffer import EpisodeBatch
 from modules.mixers.vdn import VDNMixer
 from modules.mixers.qmix import QMixer
@@ -36,8 +38,37 @@ class LDSALearner:
         self.target_mac = copy.deepcopy(mac)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
+        self.training_steps = 0
+        self.use_recl_analysis = getattr(args, "use_recl_analysis", False)
+        self.role_manager = None
+        self.analysis_save_dir = None
+        if self.use_recl_analysis:
+            self.analysis_save_dir = os.path.join(
+                getattr(args, "local_results_path", "results"),
+                "embedding_vis",
+                getattr(args, "unique_token", "ldsa"),
+            )
+            os.makedirs(self.analysis_save_dir, exist_ok=True)
+            try:
+                from role_assign.role_manager import RoleManager
+                self.role_manager = RoleManager(
+                    n_agents=args.n_agents,
+                    n_enemies=max(1, getattr(args, "n_enemies", 1)),
+                    update_interval=getattr(args, "role_update_interval", 10),
+                    short_interval=getattr(args, "role_short_interval", 5),
+                    warm_up_limit=getattr(args, "role_warm_up_limit", 20),
+                    api_key=getattr(args, "llm_api_key", None),
+                    encoding_dim=getattr(args, "role_encoding_dim", args.n_subtasks),
+                    map_name=args.env_args.get("map_name", "5m_vs_6m"),
+                    use_big_model=getattr(args, "use_big_model", False),
+                    log_file=os.path.join(getattr(args, "local_results_path", "results"), "llm_interaction_train.jsonl"),
+                )
+            except Exception as exc:
+                self.logger.console_logger.info("RoleManager init failed: {}".format(exc))
+                self.role_manager = None
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        self.training_steps += 1
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]  # [bs, eplen, 1]
         actions = batch["actions"][:, :-1] # [bs, eplen, n_agents, 1]
@@ -126,6 +157,8 @@ class LDSALearner:
 
         loss = td_loss - self.args.lambda_subtask_repr * subtask_dis_loss + self.args.lambda_subtask_prob * subtask_prob_kl_loss
 
+        self._maybe_run_recl_analysis(batch, subtask_prob_logits, t_env)
+
         # Optimise
         self.optimiser.zero_grad()
         loss.backward()
@@ -147,6 +180,121 @@ class LDSALearner:
             self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
+
+    def _maybe_run_recl_analysis(self, batch: EpisodeBatch, subtask_prob_logits: th.Tensor, t_env: int):
+        if not self.use_recl_analysis:
+            return
+        interval = max(1, getattr(self.args, "train_recl_freq", 100))
+        if self.training_steps % interval != 0:
+            return
+        if self.role_manager is None or not hasattr(self.mac.agent, "recl_net") or self.mac.agent.recl_net is None:
+            return
+
+        with th.no_grad():
+            obs = batch["obs"][:, :-1]
+            actions_onehot = batch["actions_onehot"][:, :-1]
+            zeros = th.zeros(actions_onehot.shape[0], 1, actions_onehot.shape[2], actions_onehot.shape[3], device=actions_onehot.device)
+            last_actions = th.cat([zeros, actions_onehot[:, :-1]], dim=1)
+            max_ep_t = obs.shape[1]
+            _, recl_role_embeddings = self.mac.agent.recl_net.batch_role_embed_forward(obs, last_actions, max_ep_t - 1, detach=True)
+            llm_labels = self._build_llm_labels(batch, t_env)
+            if llm_labels is None:
+                return
+            self._log_consistency_metrics(recl_role_embeddings[:, :-1], subtask_prob_logits, llm_labels, batch["filled"][:, :-1], t_env)
+
+    def _build_llm_labels(self, batch: EpisodeBatch, t_env: int):
+        if self.role_manager is None:
+            return None
+        bs = batch.batch_size
+        seq_len = batch.max_seq_length - 1
+        n_agents = self.args.n_agents
+        labels = th.full((bs, seq_len, n_agents), -1, dtype=th.long, device=batch.device)
+        filled = batch["filled"][:, :-1].squeeze(-1)
+        obs = batch["obs"][:, :-1].detach().cpu().numpy()
+        states = batch["state"][:, :-1].detach().cpu().numpy()
+        from role_assign.role_config import SMAC_ROLES
+        role_to_id = {cfg.role_type: cfg.role_id for cfg in SMAC_ROLES.values()}
+        for b in range(bs):
+            self.role_manager.env_last_update_step.pop(b, None)
+            self.role_manager.env_roles.pop(b, None)
+            for t in range(seq_len):
+                if filled[b, t].item() <= 0:
+                    continue
+                obs_list = [obs[b, t, a] for a in range(n_agents)]
+                self.role_manager.update_roles(t, obs_list=obs_list, global_state=states[b, t], env_id=b, global_env_step=t_env)
+                for a in range(n_agents):
+                    role_type = self.role_manager.env_roles[b][a]
+                    labels[b, t, a] = role_to_id.get(role_type, -1)
+        return labels
+
+    def _log_consistency_metrics(self, recl_embed, ldsa_logits, llm_labels, filled, t_env: int):
+        valid = (filled.squeeze(-1) > 0) & (llm_labels >= 0)
+        if valid.sum().item() < 8:
+            return
+        recl_flat = recl_embed[valid]
+        ldsa_flat = ldsa_logits[valid]
+        llm_flat = llm_labels[valid]
+        recl_pred = self._nearest_centroid_labels(recl_flat, llm_flat, self.args.n_subtasks)
+        ldsa_pred = ldsa_flat.argmax(dim=-1)
+
+        acc_recl_llm = (recl_pred == llm_flat).float().mean().item()
+        acc_ldsa_llm = (ldsa_pred == llm_flat).float().mean().item()
+        acc_recl_ldsa = (recl_pred == ldsa_pred).float().mean().item()
+        self.logger.log_stat("consistency/acc_recl_llm", acc_recl_llm, t_env)
+        self.logger.log_stat("consistency/acc_ldsa_llm", acc_ldsa_llm, t_env)
+        self.logger.log_stat("consistency/acc_recl_ldsa", acc_recl_ldsa, t_env)
+
+        # PCA 2D projection stats
+        recl_2d = self._pca2d(recl_flat)
+        ldsa_2d = self._pca2d(ldsa_flat)
+        self.logger.log_stat("consistency/pca_recl_var_x", recl_2d[:, 0].var().item(), t_env)
+        self.logger.log_stat("consistency/pca_ldsa_var_x", ldsa_2d[:, 0].var().item(), t_env)
+
+        # Structural similarity via representational dissimilarity matrices
+        take = min(256, recl_flat.shape[0])
+        idx = th.randperm(recl_flat.shape[0], device=recl_flat.device)[:take]
+        recl_rdm = self._rdm(recl_flat[idx])
+        ldsa_rdm = self._rdm(ldsa_flat[idx].float())
+        label_rdm = self._label_rdm(llm_flat[idx])
+        self.logger.log_stat("consistency/rdm_corr_recl_ldsa", self._corrcoef(recl_rdm, ldsa_rdm).item(), t_env)
+        self.logger.log_stat("consistency/rdm_corr_recl_llm", self._corrcoef(recl_rdm, label_rdm).item(), t_env)
+        self.logger.log_stat("consistency/rdm_corr_ldsa_llm", self._corrcoef(ldsa_rdm, label_rdm).item(), t_env)
+
+    def _nearest_centroid_labels(self, embeddings, labels, n_classes):
+        centroids = []
+        for c in range(n_classes):
+            mask = labels == c
+            if mask.any():
+                centroids.append(F.normalize(embeddings[mask].mean(dim=0), dim=0))
+            else:
+                centroids.append(th.zeros(embeddings.shape[1], device=embeddings.device))
+        centroids = th.stack(centroids, dim=0)
+        sims = th.matmul(F.normalize(embeddings, dim=-1), centroids.t())
+        return sims.argmax(dim=-1)
+
+    def _pca2d(self, x):
+        x = x.float()
+        x = x - x.mean(dim=0, keepdim=True)
+        try:
+            _, _, v = th.pca_lowrank(x, q=min(2, x.shape[1]))
+            return x @ v[:, :2]
+        except Exception:
+            return x[:, :2] if x.shape[1] >= 2 else th.cat([x, th.zeros_like(x)], dim=1)
+
+    def _rdm(self, x):
+        x = F.normalize(x.float(), dim=-1)
+        sim = th.matmul(x, x.t()).clamp(-1, 1)
+        return (1 - sim).reshape(-1)
+
+    def _label_rdm(self, y):
+        y = y.view(-1, 1)
+        return (y != y.t()).float().reshape(-1)
+
+    def _corrcoef(self, a, b):
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = (a.std() * b.std()) + 1e-8
+        return (a * b).mean() / denom
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)

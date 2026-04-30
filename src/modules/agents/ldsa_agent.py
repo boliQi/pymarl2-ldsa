@@ -1,11 +1,13 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from .recl_net import RECL_NET
 
 class LDSAAgent(nn.Module):
     def __init__(self, input_shape, args):
         super(LDSAAgent, self).__init__()
         self.args = args
+        self.raw_obs_shape = getattr(args, "obs_shape", None)
 
         # agent embedding
         self.fc1_agent_embed = nn.Linear(input_shape, args.rnn_hidden_dim)
@@ -28,6 +30,20 @@ class LDSAAgent(nn.Module):
         else:
             self.fc2_w = nn.Linear(args.agent_subtask_embed_dim, args.rnn_hidden_dim * args.n_actions)
             self.fc2_b = nn.Linear(args.agent_subtask_embed_dim, args.n_actions)
+
+        self.use_recl_analysis = getattr(args, "use_recl_analysis", False)
+        self.recl_net = None
+        if self.use_recl_analysis:
+            obs_dim = self.raw_obs_shape if self.raw_obs_shape is not None else input_shape
+            self.recl_net = RECL_NET(
+                obs_dim=obs_dim,
+                action_dim=args.n_actions,
+                n_agents=args.n_agents,
+                agent_embedding_dim=getattr(args, "agent_embedding_dim", 128),
+                role_embedding_dim=getattr(args, "role_embedding_dim", 64),
+                n_roles=getattr(args, "n_subtasks", 4),
+                use_ln=getattr(args, "recl_use_ln", False),
+            )
         
 
     def init_hidden_subtask_policy(self):
@@ -38,7 +54,7 @@ class LDSAAgent(nn.Module):
         # make hidden states on same device as model
         return self.fc1_agent_embed.weight.new(1, self.args.rnn_hidden_dim).zero_()
 
-    def forward(self, inputs, hidden_state_subtask_policy, hidden_state_agent_embed, test_mode=False):
+    def forward(self, inputs, hidden_state_subtask_policy, hidden_state_agent_embed, test_mode=False, raw_obs=None, last_action=None):
         # inputs: [bs*n_agents, input_shape]
         # subtask_embed_input: [bs*n_subtasks, n_subtasks]
 
@@ -87,7 +103,17 @@ class LDSAAgent(nn.Module):
         if self.args.evaluate:
             print('chosen_subtask_prob', subtask_prob.reshape(self.args.n_agents, self.args.n_subtasks))
         q = th.bmm(subtask_prob, q).squeeze(1) # [bs*n_agents, n_actions]
+        recl_role_embedding = None
+        if self.recl_net is not None and raw_obs is not None and last_action is not None:
+            raw_obs = raw_obs.reshape(-1, raw_obs.shape[-1])
+            last_action = last_action.reshape(-1, last_action.shape[-1])
+            recl_role_embedding = self.recl_net(raw_obs, last_action, detach=False)
+            recl_role_embedding = recl_role_embedding.reshape(-1, self.args.n_agents, recl_role_embedding.shape[-1])
 
-        return q, h_subtask_policy, h_agent_embed, subtask_prob_logit, subtask_embed 
+        return q, h_subtask_policy, h_agent_embed, subtask_prob_logit, subtask_embed, recl_role_embedding
         # [bs*n_agents, n_actions], [bs*n_agents, rnn_hidden_dim], [bs*n_agents, rnn_hidden_dim], [bs*n_agents, 1, n_subtasks], [bs, n_subtasks, embed_dim]
 
+    def get_recl_parameters(self):
+        if self.recl_net is None:
+            return []
+        return self.recl_net.get_recl_parameters()

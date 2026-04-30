@@ -43,3 +43,20 @@ use_tanh: True
 subtask_repr_layers: 2
 random_sele: False # select a subtask randomly if True
 
+# RECL + LLM analysis (parallel comparison mode)
+use_recl_analysis: True
+use_llm_for_labels: True
+role_encoding_dim: 4
+role_update_interval: 10
+role_short_interval: 5
+role_warm_up_limit: 20
+train_recl_freq: 100
+agent_embedding_dim: 128
+role_embedding_dim: 64
+recl_use_ln: False
+use_big_model: False
+load_pretrained_recl: True
+pretrained_recl_path: "results/pretrained_roles/recl_net_pretrained_mixed_5000.pt"
+pretrained_prototypes_path: "results/pretrained_roles/recl_net_pretrained_mixed_5000_prototypes.pt"
+freeze_recl: True
+
