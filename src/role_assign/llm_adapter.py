@@ -1,18 +1,17 @@
+﻿import os
 import sys
-import os
 
-# === 新增: 添加父目录到 sys.path 以便找到 language 包 ===
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# ======================================================
+# Ensure project root is importable so `language.call_llm` can be resolved.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-# Try to import the existing LLM agent
-# Assuming the project root is in PYTHONPATH
 try:
     from language.call_llm import LLM
 except ImportError:
-    # Fallback or mock if running in isolation
-    print("Warning: Could not import 'language.call_llm'. Using MockLLMAgent.")
     LLM = None
+
 
 class LLMAdapter:
     def __init__(
@@ -26,55 +25,48 @@ class LLMAdapter:
         self.use_big_model = use_big_model
         self.enable_thinking = enable_thinking
         self.thinking_budget_tokens = thinking_budget_tokens
-        # 实际项目中这里可以替换为真实的 OpenAI 客户端
-        if LLM:
-            # Assuming gpt_agent constructor signature based on context
-            # You might need to adjust arguments based on actual call_llm.py
-            self.llm = LLM(mode='openai')
-        else:
-            self.llm = None
+
+        if LLM is None:
+            raise ImportError(
+                "Failed to import 'language.call_llm.LLM'. "
+                "Please ensure 'language/call_llm.py' exists under the project root "
+                "and PYTHONPATH includes the project root."
+            )
+
+        self.llm = LLM(mode='openai')
 
     def query(self, prompt: str) -> str:
-        if self.llm:
-            # Using the 'ask' method from the user's existing code
-            # === [修改] 将之前 mock 的调用替换为真实调用 ===
-            response = self.llm.call_llm(
-                prompt,
-                big_model=self.use_big_model,
-                temperature=0.0,
-                enable_thinking=self.enable_thinking,
-                thinking_budget_tokens=self.thinking_budget_tokens,
-            )
-            return response
-            # ======================================
-        else:
-            # === 修改: 返回 3 个角色以匹配测试用例 ===
-            print("query with no llm")
-            return "Attacker, Defender, Supporter"
-            # ======================================
+        if self.llm is None:
+            raise RuntimeError("LLM client is not initialized.")
+
+        return self.llm.call_llm(
+            prompt,
+            big_model=self.use_big_model,
+            temperature=0.0,
+            enable_thinking=self.enable_thinking,
+            thinking_budget_tokens=self.thinking_budget_tokens,
+        )
 
     def get_role_assignment(self, state_description: str, available_roles: list, num_agents: int, current_roles: list, map_name: str = "5m_vs_6m") -> list:
         """
         Constructs a prompt and parses the response to get a list of roles.
-      
+
         Args:
-            state_description: 当前状态描述
-            available_roles: 可用角色列表
-            num_agents: 智能体数量
-            current_roles: 当前各智能体的角色名称列表（用于保持）
-            map_name: 当前地图名称
+            state_description: current state description
+            available_roles: available role configs
+            num_agents: number of agents
+            current_roles: current role names for each agent
+            map_name: current map name
         """
         if current_roles is None:
-            print(f"!!!!!!!!!No current roles provided, initializing to default 'Shield' roles.")
-        
+            print("No current roles provided, initializing to default 'Shield' roles.")
+
         roles_str = ", ".join([r.name for r in available_roles])
-        
-        # --- Prompt Definitions ---
-        
+
         prompt_5m_vs_6m = f"""
 # Environment: StarCraft Multi-Agent Challenge (SMAC) - Map: {map_name}
 # Scenario Context: {map_name} (Homogeneous Marines)
-You are controlling 5 Marines against 6 enemy Marines. 
+You are controlling 5 Marines against 6 enemy Marines.
 CRITICAL TACTIC: You CANNOT win by brute force. You must use **Health Rotation**.
 - **The Goal**: Distribute damage across all allies. Ideally, all 5 allies survive with low HP, rather than 1 ally dying early.
 - **The Mechanism**: High HP units must step forward to shield Low HP units. Low HP units must retreat to the backline but keep shooting.
@@ -157,23 +149,20 @@ Return a comma-separated list of roles, one for each agent (e.g., "Shield, Survi
 Do not include any other text.
 """
         response = self.query(prompt)
-        
-        # Simple parsing logic
+
         cleaned_response = response.strip().replace("\n", "").replace(".", "").replace("[", "").replace("]", "")
         tokens = cleaned_response.split(",")
-        
-        # 二次清洗：去除每个 token 两端的空白和可能的引号
+
         final_roles = []
         for token in tokens:
             cleaned_token = token.strip().strip("'").strip('"')
             if ":" in cleaned_token:
                 cleaned_token = cleaned_token.split(":")[-1].strip()
             final_roles.append(cleaned_token)
-        
-        # Fallback if parsing fails
+
         if len(final_roles) != num_agents:
             print(f"LLM returned {len(final_roles)} roles, expected {num_agents}. Using default.")
             print(f"LLM returned {final_roles}")
             return current_roles
-            
+
         return final_roles
