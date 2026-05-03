@@ -41,8 +41,8 @@ class Agent_Embedding(nn.Module):
         inputs = torch.cat([obs, last_a], dim=-1)
         fc1_out = torch.relu(self.fc1(inputs))
         
-        # Initialize hidden state if needed
-        if self.rnn_hidden is None:
+        # Reset hidden when batch shape changes (e.g., runner batch vs learner batch)
+        if self.rnn_hidden is None or self.rnn_hidden.size(0) != fc1_out.size(0):
             self.rnn_hidden = torch.zeros(fc1_out.size(0), self.agent_embedding_dim, 
                                           device=fc1_out.device, dtype=fc1_out.dtype)
         
